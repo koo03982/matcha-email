@@ -232,13 +232,13 @@ def _send_mail(subject, body, kind="EMAIL"):
     log(f"  {kind} SENT to {', '.join(recipients)}: {subject}")
 
 
- def send_email(restocked):
+def send_email(restocked):
     body_lines = [f"IN STOCK: {p['name']}  ({p['category']})\n  {p['url']}" for p in restocked]
     body = ("Back in stock at Marukyu-Koyamaen:\n\n"
             + "\n\n".join(body_lines)
             + "\n\nMatcha is limited to 5 items per order. Move fast.")
     names = ", ".join(p["name"] for p in restocked)
-   # _send_mail(f"Matcha restock: {names}", body, kind="RESTOCK EMAIL")
+    _send_mail(f"Matcha restock: {names}", body, kind="RESTOCK EMAIL")
 
 
 def extract_name(html):
