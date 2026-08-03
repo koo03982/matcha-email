@@ -212,7 +212,7 @@ def in_stock(html):
     return OUT_OF_STOCK_MARKER not in html.lower()
 
 
-def _send_mail(subject, body, kind="EMAIL"):
+# def _send_mail(subject, body, kind="EMAIL"):
     """Send one email to the configured recipients. All alert emails go
     through here so credential handling and delivery logic live in one place."""
     user, pw = os.environ.get("MATCHA_SMTP_USER"), os.environ.get("MATCHA_SMTP_PASS")
@@ -232,13 +232,13 @@ def _send_mail(subject, body, kind="EMAIL"):
     log(f"  {kind} SENT to {', '.join(recipients)}: {subject}")
 
 
-def send_email(restocked):
+# def send_email(restocked):
     body_lines = [f"IN STOCK: {p['name']}  ({p['category']})\n  {p['url']}" for p in restocked]
     body = ("Back in stock at Marukyu-Koyamaen:\n\n"
             + "\n\n".join(body_lines)
             + "\n\nMatcha is limited to 5 items per order. Move fast.")
     names = ", ".join(p["name"] for p in restocked)
-    _send_mail(f"Matcha restock: {names}", body, kind="RESTOCK EMAIL")
+   # _send_mail(f"Matcha restock: {names}", body, kind="RESTOCK EMAIL")
 
 
 def extract_name(html):
@@ -299,7 +299,7 @@ def send_new_product_email(new_products):
             + "\n\n".join(body_lines)
             + "\n\nYou'll get a restock alert whenever any of these comes into stock.")
     names = ", ".join(p["name"] for p in new_products)
-    _send_mail(f"New matcha added: {names}", body, kind="NEW-PRODUCT EMAIL")
+    # _send_mail(f"New matcha added: {names}", body, kind="NEW-PRODUCT EMAIL")
 
 
 def run_once(force=False):
@@ -363,7 +363,7 @@ def run_once(force=False):
 
     if restocked:
         try:
-            send_email(restocked)
+            # send_email(restocked)
         except Exception as e:
             # Keep these marked sold-out so the alert is retried on the next run
             # instead of being lost forever.
@@ -379,7 +379,7 @@ def main():
     load_env()
     if "--test-email" in sys.argv:
         log("Sending a test email to confirm credentials/delivery...")
-        send_email([{"name": "TEST — ignore me", "category": "setup check",
+        # send_email([{"name": "TEST — ignore me", "category": "setup check",
                      "url": "https://www.marukyu-koyamaen.co.jp/english/shop/products/catalog/matcha"}])
         return
     force = "--force" in sys.argv
