@@ -212,7 +212,7 @@ def in_stock(html):
     return OUT_OF_STOCK_MARKER not in html.lower()
 
 
- def _send_mail(subject, body, kind="EMAIL"):
+def _send_mail(subject, body, kind="EMAIL"):
     """Send one email to the configured recipients. All alert emails go
     through here so credential handling and delivery logic live in one place."""
     user, pw = os.environ.get("MATCHA_SMTP_USER"), os.environ.get("MATCHA_SMTP_PASS")
