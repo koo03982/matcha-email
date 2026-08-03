@@ -380,7 +380,7 @@ def main():
     if "--test-email" in sys.argv:
         log("Sending a test email to confirm credentials/delivery...")
         # send_email([{"name": "TEST — ignore me", "category": "setup check",
-                     "url": "https://www.marukyu-koyamaen.co.jp/english/shop/products/catalog/matcha"}])
+        #             "url": "https://www.marukyu-koyamaen.co.jp/english/shop/products/catalog/matcha"}])
         return
     force = "--force" in sys.argv
     if "--loop" in sys.argv:
