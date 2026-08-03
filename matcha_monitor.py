@@ -381,7 +381,7 @@ def main():
        log("Sending a test email to confirm credentials/delivery...")
        send_email([{"name": "TEST — ignore me", "category": "setup check",
                      "url": "https://www.marukyu-koyamaen.co.jp/english/shop/products/catalog/matcha"}])
-        return
+       return
     force = "--force" in sys.argv
     if "--loop" in sys.argv:
         i = sys.argv.index("--loop")
