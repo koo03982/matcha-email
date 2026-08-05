@@ -8,7 +8,7 @@
     {"id": "1111020c1", "name": "Tenju", "category": "Principal matcha", "watch": false},
     {"id": "1131020c1", "name": "Eiju", "category": "Principal matcha", "watch": true},
     {"id": "1151020c1", "name": "Kinrin", "category": "Principal matcha", "watch": false},
-    {"id": "1171020c1", "name": "Yugen", "category": "Principal matcha", "watch": false},
+    {"id": "1171020c1", "name": "Yugen", "category": "Principal matcha", "watch": true},
     {"id": "1181040c1", "name": "Chigi no Shiro", "category": "Principal matcha", "watch": true},
     {"id": "1191040c1", "name": "Isuzu", "category": "Principal matcha", "watch": true},
     {"id": "11a1040c1", "name": "Aoarashi", "category": "Principal matcha", "watch": true},
@@ -46,8 +46,8 @@
     {"id": "1184040c1", "name": "Joko (Shokokuji)", "category": "Temple", "watch": false},
 
     {"id": "1f94020c1", "name": "Low Caffeine Matcha", "category": "Limited Edition", "watch": true},
-    {"id": "1dbd020c1", "name": "Suzukumo (matcha for cold water)", "category": "Limited Edition", "watch": true},
-    {"id": "11b5040c1", "name": "Gabaron Matcha", "category": "Limited Edition", "watch": true},
+    {"id": "1dbd020c1", "name": "Suzukumo (matcha for cold water)", "category": "Limited Edition", "watch": false},
+    {"id": "11b5040c1", "name": "Gabaron Matcha", "category": "Limited Edition", "watch": false},
     {"id": "1dcd020c1", "name": "Awaraku (matcha for cold water)", "category": "Limited Edition", "watch": true},
 
     {"id": "11b1100c1", "name": "Wakatake", "category": "Matcha for Cooking", "watch": false},
