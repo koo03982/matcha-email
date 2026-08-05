@@ -4,7 +4,7 @@
   "currency": "USD",
   "products": [
     {"id": "1g36020c1", "name": "Kiwami Choan", "category": "Principal matcha", "watch": false},
-    {"id": "1161020c1", "name": "Wako", "category": "Principal matcha", "watch": false},
+    {"id": "1161020c1", "name": "Wako", "category": "Principal matcha", "watch": true},
     {"id": "1111020c1", "name": "Tenju", "category": "Principal matcha", "watch": false},
     {"id": "1131020c1", "name": "Eiju", "category": "Principal matcha", "watch": true},
     {"id": "1151020c1", "name": "Kinrin", "category": "Principal matcha", "watch": false},
