@@ -57,6 +57,7 @@
     {"id": "1c55000cc", "name": "Sweetened Matcha - Designed For Milk", "category": "Sweetened Matcha", "watch": false},
     {"id": "1g28200c6", "name": "Hojicha Mix", "category": "Sweetened Matcha", "watch": false},
     {"id": "1g9d000cc", "name": "Matcha Mix", "category": "Sweetened Matcha", "watch": false},
-    {"id": "1d9d000cc", "name": "Matcha Soda", "category": "Sweetened Matcha", "watch": false}
+    {"id": "1d9d000cc", "name": "Matcha Soda", "category": "Sweetened Matcha", "watch": false},
+    {"id": "1233100c7", "name": "Hojicha Powder type A", "category": "Seasonal & Limited Edition", "watch": true}
   ]
 }
