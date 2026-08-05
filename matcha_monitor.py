@@ -1,258 +1,401 @@
 #!/usr/bin/env python3
 """
-matcha-tg-monitor
-------------------
-Watches Marukyu Koyamaen matcha products and sends a Telegram message the
-moment one goes from sold-out to in-stock.
+Marukyu-Koyamaen matcha restock monitor
+========================================
 
-Detection strategy: the shop's product pages always show the exact text
-"currently out of stock and unavailable" when a product is sold out --
-regardless of whether the visitor is logged in. When that text is absent
-(and the page otherwise looks like a genuine, fully-loaded product page)
-the product is treated as buyable. This deliberately does NOT rely on
-spotting an "Add to cart" button, because that button is only rendered for
-logged-in accounts -- an anonymous request never sees it, in-stock or not.
+Checks each matcha product page on the Marukyu-Koyamaen international shop and
+emails you the moment anything flips from SOLD OUT -> IN STOCK.
 
-Scheduling: GitHub's own `schedule:` cron trigger is heavily throttled in
-practice (often firing every few hours instead of every few minutes), so it
-must not be relied on for a tight cadence. The real 3-minute cadence comes
-from an external pinger (e.g. cron-job.org) calling this workflow's
-workflow_dispatch API on a timer. See README.md for setup.
+It reads products.json (same folder), remembers the last status in state.json,
+and only emails on a genuine restock (a size becoming available again).
+
+Checks run around the clock: most restocks happen Mon-Fri 09:00-17:30 Japan
+time, but they've been observed outside those hours too.
+
+To be considerate to the shop (it explicitly asks people not to hammer it), each
+5-minute run only re-checks products that are currently sold out -- the only ones
+that *could* restock -- and does a full sweep once an hour to pick up new sell-outs.
+
+--------------------------------------------------------------------------------
+ONE-TIME EMAIL SETUP
+--------------------------------------------------------------------------------
+1. Turn on 2-Step Verification for your Google account.
+2. Create an App Password:  https://myaccount.google.com/apppasswords
+3. Put your credentials in a file next to this script called  .env  :
+       MATCHA_SMTP_USER=you@gmail.com
+       MATCHA_SMTP_PASS=your16charapppassword
+       MATCHA_MAIL_TO=you@gmail.com
+   (or export them as environment variables instead)
+
+--------------------------------------------------------------------------------
+RUN IT
+--------------------------------------------------------------------------------
+   python3 matcha_monitor.py            # one check now
+   python3 matcha_monitor.py --force    # one check now, full sweep of all products
+   python3 matcha_monitor.py --loop 5   # check every 5 minutes forever
+
+For fully automatic background running, use the included launchd file
+(com.matcha.monitor.plist) -- see README.md.
 """
 
 import json
 import os
+import re
 import sys
 import time
+import smtplib
+import urllib.request
 from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 
-import requests
+# ------------------------------ paths & config --------------------------------
+HERE = Path(__file__).resolve().parent
+PRODUCTS_FILE = HERE / "products.json"
+STATE_FILE = HERE / "state.json"
+LOG_FILE = HERE / "monitor.log"
+ENV_FILE = HERE / ".env"
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent
-PRODUCTS_FILE = ROOT / "products.json"
-STATE_FILE = ROOT / "state.json"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+OUT_OF_STOCK_MARKER = "currently out of stock and unavailable"  # WooCommerce phrase
+USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+REQUEST_TIMEOUT = 30
+POLITE_DELAY = 2.0        # seconds between product requests
+# ------------------------------------------------------------------------------
 
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
+
+def load_env():
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'").strip()
+                if k == "MATCHA_SMTP_PASS":
+                    v = v.replace(" ", "")  # Gmail shows app passwords spaced; they work unspaced
+                os.environ[k] = v
+
+
+def jst_now():
+    return datetime.now(timezone(timedelta(hours=9)))
+
+
+def stamp():
+    """Timestamp format used in state entries."""
+    return jst_now().strftime("%Y-%m-%d %H:%M JST")
+
+
+def log(msg):
+    ts = jst_now().strftime("%Y-%m-%d %H:%M:%S JST")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def load_catalog():
+    """products.json, parsed once per run and shared by every consumer."""
+    return json.loads(PRODUCTS_FILE.read_text(encoding="utf-8"))
+
+
+def shop_base(catalog):
+    return catalog["base_url"], catalog.get("currency", "USD")
+
+
+def product_url(base, pid, cur):
+    return f"{base}{pid}?currency={cur}"
+
+
+def load_products(catalog, state=None):
+    base, cur = shop_base(catalog)
+    items = []
+    for p in catalog["products"]:
+        if p.get("watch", True):
+            p = dict(p)
+            p["url"] = product_url(base, p["id"], cur)
+            items.append(p)
+    # Include auto-discovered products (stored in state.json) that are watched.
+    if state:
+        listed = {p["id"] for p in items}
+        for pid, s in state.items():
+            if s.get("discovered") and s.get("watch", True) and pid not in listed:
+                items.append({"id": pid, "name": s.get("name", pid),
+                              "category": s.get("category", "New arrival"),
+                              "url": product_url(base, pid, cur)})
+    return items
+
+
+def all_known_ids(catalog, state):
+    ids = {p["id"] for p in catalog["products"]}
+    ids |= set(state.keys())
+    return ids
+
+
+def load_state():
+    return json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+              "image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
 
-TIMEOUT_SECONDS = 20
-MAX_RETRIES = 2
-REQUEST_SPACING_SECONDS = 2  # be polite to the shop between products
-
-JST = timezone(timedelta(hours=9))
-
-OUT_OF_STOCK_MARKER = "currently out of stock and unavailable"
-
-# Always present on a genuine, fully-loaded product page, whether or not the
-# visitor is logged in and whether or not the item is in stock. Used to
-# reject error/placeholder pages.
-PAGE_SANITY_MARKERS = ["Product Detail", "SKU"]
-
-# Signs of an anti-bot challenge / block / generic error page. If any of
-# these show up, we do NOT trust this read either way -- skip the update
-# rather than risk a false positive or a false "still out of stock".
-BLOCK_MARKERS = [
-    "access denied",
-    "attention required",
-    "captcha",
-    "cloudflare",
-    "are you a robot",
-    "unusual traffic",
-]
-
-MIN_VALID_PAGE_LENGTH = 5000
+# A real product page always contains these; a block/error page won't. Used to
+# avoid mistaking a 403/challenge page for an "in stock" product.
+PAGE_SENTINELS = ("preparation of matcha", "proceed to cart", "best before")
 
 
-# --------------------------------------------------------------------------
-# Products / state
-# --------------------------------------------------------------------------
-def load_products() -> dict:
-    data = json.loads(PRODUCTS_FILE.read_text(encoding="utf-8"))
-    base_url = data["base_url"]
-    return {
-        p["id"]: {"name": p["name"], "url": base_url + p["id"]}
-        for p in data["products"]
-        if p.get("watch", True)
-    }
-
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
+def _decode(data, encoding):
+    encoding = (encoding or "").lower()
+    if "gzip" in encoding:
+        import gzip as _gz
+        data = _gz.decompress(data)
+    elif "deflate" in encoding:
+        import zlib
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            print("[warn] state.json is corrupted, starting fresh", file=sys.stderr)
-    return {}
+            data = zlib.decompress(data)
+        except zlib.error:
+            data = zlib.decompress(data, -zlib.MAX_WBITS)
+    return data.decode("utf-8", "ignore")
 
 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+def _curl_fetch(url):
+    """Fallback via the system curl (different TLS stack; slips past some WAFs)."""
+    import subprocess
+    cmd = ["curl", "-sS", "--compressed", "--http2", "--max-time", str(REQUEST_TIMEOUT),
+           "-A", USER_AGENT,
+           "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+           "-H", "Accept-Language: en-US,en;q=0.9",
+           url]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=REQUEST_TIMEOUT + 5)
+    if out.returncode != 0 or not out.stdout:
+        raise RuntimeError(f"curl rc={out.returncode} {out.stderr.strip()[:120]}")
+    return out.stdout
 
 
-# --------------------------------------------------------------------------
-# Stock check
-# --------------------------------------------------------------------------
-def fetch_page(url: str) -> str | None:
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.get(url, headers=REQUEST_HEADERS, timeout=TIMEOUT_SECONDS)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as exc:
-            last_error = exc
-            print(f"[warn] attempt {attempt}/{MAX_RETRIES} failed for {url}: {exc}", file=sys.stderr)
-            time.sleep(2)
-    print(f"[error] could not fetch {url}: {last_error}", file=sys.stderr)
+def fetch(url):
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+            return _decode(r.read(), r.headers.get("Content-Encoding"))
+    except Exception:
+        return _curl_fetch(url)   # try curl before giving up
+
+
+def is_product_page(html):
+    h = html.lower()
+    return any(s in h for s in PAGE_SENTINELS)
+
+
+def in_stock(html):
+    return OUT_OF_STOCK_MARKER not in html.lower()
+
+
+def _send_mail(subject, body, kind="EMAIL"):
+    """Send one email to the configured recipients. All alert emails go
+    through here so credential handling and delivery logic live in one place."""
+    user, pw = os.environ.get("MATCHA_SMTP_USER"), os.environ.get("MATCHA_SMTP_PASS")
+    to_raw = os.environ.get("MATCHA_MAIL_TO", user) or ""
+    recipients = [a.strip() for a in to_raw.split(",") if a.strip()]
+    if not (user and pw and recipients):
+        log(f"  {kind} SKIPPED: MATCHA_SMTP_USER / MATCHA_SMTP_PASS / MATCHA_MAIL_TO not set (see .env).")
+        return
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"], msg["To"] = user, ", ".join(recipients)
+    msg.set_content(body)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=REQUEST_TIMEOUT) as s:
+        s.starttls()
+        s.login(user, pw)
+        s.send_message(msg, to_addrs=recipients)
+    log(f"  {kind} SENT to {', '.join(recipients)}: {subject}")
+
+
+def send_email(restocked):
+    body_lines = [f"IN STOCK: {p['name']}  ({p['category']})\n  {p['url']}" for p in restocked]
+    body = ("Back in stock at Marukyu-Koyamaen:\n\n"
+            + "\n\n".join(body_lines)
+            + "\n\nMatcha is limited to 5 items per order. Move fast.")
+    names = ", ".join(p["name"] for p in restocked)
+    _send_mail(f"Matcha restock: {names}", body, kind="RESTOCK EMAIL")
+
+
+def extract_name(html):
+    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)', html, re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'<title>([^<|]+)', html, re.I)
+    if m:
+        return m.group(1).strip()
     return None
 
 
-def is_available(html: str) -> bool | None:
-    """
-    Returns:
-      True  -> confidently in stock
-      False -> confidently out of stock
-      None  -> page could not be trusted (too short / not a real product
-               page / looks like a bot-block or error page). Caller must
-               skip this update rather than treat None as "out of stock".
-    """
-    if len(html) < MIN_VALID_PAGE_LENGTH:
-        return None
-
-    if not all(marker in html for marker in PAGE_SANITY_MARKERS):
-        return None
-
-    lowered = html.lower()
-    if any(marker in lowered for marker in BLOCK_MARKERS):
-        return None
-
-    return OUT_OF_STOCK_MARKER not in html
-
-
-# --------------------------------------------------------------------------
-# Telegram
-# --------------------------------------------------------------------------
-def send_telegram_message(text: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[error] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in environment", file=sys.stderr)
-        return False
-
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+def discover_new(catalog, state):
+    """Scan the shop's Matcha catalog for product IDs we've never seen. New ones
+    get auto-added to state (watched) and returned so we can email about them."""
+    base, cur = shop_base(catalog)
+    catalog_url = f"{base}catalog/matcha?viewall=1"
     try:
-        resp = requests.post(api_url, data=payload, timeout=TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        return True
-    except requests.RequestException as exc:
-        print(f"[error] failed to send Telegram message: {exc}", file=sys.stderr)
-        return False
+        html = fetch(catalog_url)
+    except Exception as e:
+        log(f"  (discovery skipped: catalog fetch failed: {e})")
+        return []
+    # Product IDs start with a digit; category slugs (catalog, matcha, ...) don't.
+    ids = set(re.findall(r'/english/shop/products/([0-9][0-9a-z]{4,})', html))
+    if len(ids) < 30:
+        log(f"  (discovery skipped: catalog looked blocked/incomplete - {len(ids)} links)")
+        return []
+    known = all_known_ids(catalog, state)
+    new_ids = sorted(i for i in ids if i not in known)
+    if not new_ids:
+        return []
+    checked_at = stamp()
+    discovered = []
+    for pid in new_ids:
+        url = product_url(base, pid, cur)
+        try:
+            phtml = fetch(url)
+        except Exception:
+            phtml = ""
+        # Only auto-watch if it verifiably looks like a Matcha product page.
+        if not (phtml and is_product_page(phtml) and "matcha" in phtml.lower()):
+            state[pid] = {"name": extract_name(phtml) or pid, "in_stock": None,
+                          "checked": checked_at, "discovered": True, "watch": False,
+                          "note": "auto-found but unverified / not matcha"}
+            time.sleep(POLITE_DELAY)
+            continue
+        name = extract_name(phtml) or pid
+        state[pid] = {"name": name, "in_stock": in_stock(phtml), "checked": checked_at,
+                      "discovered": True, "watch": True, "category": "New arrival"}
+        discovered.append({"id": pid, "name": name, "url": url})
+        time.sleep(POLITE_DELAY)
+    return discovered
 
 
-def build_stock_notification(name: str, url: str) -> str:
-    return f"🍵 <b>{name}</b> is now IN STOCK\n{url}\n\nDetected by matcha-tg-monitor."
+def send_new_product_email(new_products):
+    body_lines = [f"{p['name']}\n  {p['url']}" for p in new_products]
+    body = ("New matcha just appeared on Marukyu-Koyamaen (now being watched for restocks):\n\n"
+            + "\n\n".join(body_lines)
+            + "\n\nYou'll get a restock alert whenever any of these comes into stock.")
+    names = ", ".join(p["name"] for p in new_products)
+    _send_mail(f"New matcha added: {names}", body, kind="NEW-PRODUCT EMAIL")
 
 
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
-def main() -> int:
-    products = load_products()
+def run_once(force=False):
     state = load_state()
-    exit_code = 0
+    catalog = load_catalog()
 
-    for idx, (pid, product) in enumerate(products.items()):
-        if idx > 0:
-            time.sleep(REQUEST_SPACING_SECONDS)
+    # Full sweep on first run, at the top of each hour, or when forced.
+    full_sweep = force or not state or jst_now().minute < 6
 
-        html = fetch_page(product["url"])
-        prev = state.get(pid, {})
-        was_in_stock = prev.get("in_stock", False)
+    # Auto-discover brand-new matcha added to the shop. The catalog page is the
+    # heaviest page on the site, so only fetch it on hourly full sweeps —
+    # spotting a new product within the hour is plenty fast.
+    if full_sweep:
+        newly = discover_new(catalog, state)
+        if newly:
+            for p in newly:
+                log(f"  ** NEW PRODUCT ** {p['name']}")
+            try:
+                send_new_product_email(newly)
+            except Exception as e:
+                log(f"  ! NEW-PRODUCT EMAIL FAILED ({e}) - continuing with stock check")
 
-        if html is None:
-            print(f"[warn] {product['name']}: fetch failed, leaving previous state untouched", file=sys.stderr)
-            exit_code = 1
+    products = load_products(catalog, state)
+
+    if full_sweep:
+        to_check = products
+    else:
+        to_check = [p for p in products
+                    if state.get(p["id"], {}).get("in_stock") is not True]
+
+    log(f"Checking {len(to_check)} product(s) "
+        f"({'full sweep' if full_sweep else 'sold-out candidates only'}).")
+
+    restocked = []
+    checked_at = stamp()
+    blocked = 0
+    for p in to_check:
+        try:
+            html = fetch(p["url"])
+        except Exception as e:
+            log(f"  ! {p['name']}: fetch error ({e}) - state unchanged")
+            time.sleep(POLITE_DELAY)
             continue
-
-        available = is_available(html)
-
-        if available is None:
-            print(f"[warn] {product['name']}: page not trusted (block/error page?), skipping this read", file=sys.stderr)
-            exit_code = 1
+        if not is_product_page(html):
+            # Blocked / challenge / error page — do NOT treat as in stock.
+            blocked += 1
+            log(f"  ! {p['name']}: blocked or non-product response - state unchanged")
+            time.sleep(POLITE_DELAY)
             continue
+        stock = in_stock(html)
+        prev = state.get(p["id"], {}).get("in_stock")
+        if stock and prev is False:
+            restocked.append(p)
+            log(f"  ** RESTOCK ** {p['name']}")
+        state[p["id"]] = {"name": p["name"], "in_stock": stock, "checked": checked_at}
+        time.sleep(POLITE_DELAY)
 
-        print(f"[info] {product['name']}: in_stock={available} (was {was_in_stock})")
+    if blocked:
+        log(f"  WARNING: {blocked}/{len(to_check)} requests were blocked by the shop "
+            f"(bot protection). No alerts sent for those.")
 
-        if available and not was_in_stock:
-            if not send_telegram_message(build_stock_notification(product["name"], product["url"])):
-                exit_code = 1
-
-        state[pid] = {
-            "name": product["name"],
-            "in_stock": available,
-            "checked": datetime.now(JST).strftime("%Y-%m-%d %H:%M JST"),
-        }
-
+    if restocked:
+        try:
+            send_email(restocked)
+        except Exception as e:
+            # Keep these marked sold-out so the alert is retried on the next run
+            # instead of being lost forever.
+            log(f"  ! RESTOCK EMAIL FAILED ({e}) - will retry next run")
+            for p in restocked:
+                state[p["id"]]["in_stock"] = False
+    else:
+        log("  No new restocks.")
     save_state(state)
-    return exit_code
+
+
+def main():
+    load_env()
+    if "--test-email" in sys.argv:
+        log("Sending a test email to confirm credentials/delivery...")
+        send_email([{"name": "TEST — ignore me", "category": "setup check",
+                     "url": "https://www.marukyu-koyamaen.co.jp/english/shop/products/catalog/matcha"}])
+        return
+    force = "--force" in sys.argv
+    if "--loop" in sys.argv:
+        i = sys.argv.index("--loop")
+        minutes = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else 5
+        log(f"Starting loop: every {minutes} min (Ctrl-C to stop).")
+        while True:
+            try:
+                run_once(force=force)
+            except Exception as e:
+                log(f"run error: {e}")
+            time.sleep(minutes * 60)
+    else:
+        run_once(force=force)
 
 
 if __name__ == "__main__":
-    if "--test-telegram" in sys.argv:
-        ok = send_telegram_message("✅ matcha-tg-monitor test message -- Telegram credentials are working.")
-        sys.exit(0 if ok else 1)
-    if "--diagnose" in sys.argv:
-        sys.exit(diagnose())
-    sys.exit(main())
-
-
-def diagnose() -> int:
-    """Fetch the first watched product's page and print raw diagnostics,
-    without touching state.json or sending any notification."""
-    products = load_products()
-    pid, product = next(iter(products.items()))
-    print(f"[diagnose] fetching {product['name']}: {product['url']}")
-    html = fetch_page(product["url"])
-    if html is None:
-        print("[diagnose] fetch_page returned None (network error / all retries failed)")
-        return 1
-    print(f"[diagnose] response length: {len(html)} chars")
-    print(f"[diagnose] MIN_VALID_PAGE_LENGTH: {MIN_VALID_PAGE_LENGTH}")
-    print(f"[diagnose] contains OUT_OF_STOCK_MARKER: {OUT_OF_STOCK_MARKER in html}")
-    for marker in PAGE_SANITY_MARKERS:
-        print(f"[diagnose] contains sanity marker {marker!r}: {marker in html}")
-    lowered = html.lower()
-    for marker in BLOCK_MARKERS:
-        if marker in lowered:
-            print(f"[diagnose] MATCHED block marker: {marker!r}")
-    print("[diagnose] first 500 chars of response:")
-    print(html[:500])
-    print("[diagnose] ...")
-    print("[diagnose] last 300 chars of response:")
-    print(html[-300:])
-    return 0
+    main()
